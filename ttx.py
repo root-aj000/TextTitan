@@ -1,36 +1,46 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline, logging
 from docx import Document
+from tqdm import tqdm
 import os
+import sys
+import time
 
 # ---------------------------
 # CONFIGURATION
 # ---------------------------
-INPUT_DOCX = "input.docx"        # Input Word file
-OUTPUT_MD = "rewritten.md"       # Output Markdown file
-CHUNK_SIZE = 80                  # Words per chunk
-
-# Model: TinyLlama runs on CPU (8GB RAM ok)
+INPUT_DOCX = "./src/input.docx"        # Input Word file
+OUTPUT_MD = "./src/rewritten.md"       # Output Markdown file
+CHUNK_SIZE = 80                        # Words per chunk
 MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+MODEL_DIR = "./model"                  # Local save directory for model
 
 # ---------------------------
-# LOAD MODEL
+# ENABLE LOGGING
 # ---------------------------
-device = 0 if torch.cuda.is_available() else -1
+logging.set_verbosity_info()      # Options: debug / info / warning / error
+logging.enable_explicit_format()
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+os.environ["TORCH_SHOW_CPP_STACKTRACES"] = "1"
+torch.set_printoptions(precision=4, sci_mode=False)
+
+# ---------------------------
+# LOAD / CACHE MODEL
+# ---------------------------
+if not os.path.exists(MODEL_DIR):
+    print("=====================================================")
+    print(" Downloading model from Hugging Face...")
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, cache_dir=MODEL_DIR)
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
-    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    cache_dir=MODEL_DIR,
+    dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
     device_map="auto" if torch.cuda.is_available() else None
 )
 
-generator = pipeline(
-    "text-generation",
-    model=model,
-    tokenizer=tokenizer,
-    device=device
-)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
 
 # ---------------------------
 # HELPERS
@@ -40,19 +50,60 @@ def chunk_text(text, size=CHUNK_SIZE):
     words = text.split()
     return [" ".join(words[i:i + size]) for i in range(0, len(words), size)]
 
-def llama_generate(prompt):
-    """Generate rewritten text from TinyLlama."""
-    output = generator(
-        prompt,
-        max_length=512,
-        do_sample=True,
-        top_p=0.9,
-        temperature=0.7
-    )
-    return output[0]["generated_text"]
+def llama_generate(prompt, stream=True):
+    """Generate rewritten text from TinyLlama with logs and streaming output."""
+    print("\n🧠 Model generating...")
+
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+
+    if stream:
+        generated = inputs["input_ids"]
+        prev_text = ""
+
+        for _ in range(512):  # max tokens
+            with torch.no_grad():
+                outputs = model(input_ids=generated)
+                next_token_logits = outputs.logits[:, -1, :]
+                next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)
+
+            generated = torch.cat((generated, next_token_id), dim=1)
+
+            # Decode full sequence so far
+            decoded_so_far = tokenizer.decode(generated[0], skip_special_tokens=True)
+
+            # Find new part to print
+            new_text = decoded_so_far[len(prev_text):]
+            if new_text:
+                sys.stdout.write(new_text)
+                sys.stdout.flush()
+                time.sleep(0.01)
+
+            prev_text = decoded_so_far
+
+            if next_token_id.item() == tokenizer.eos_token_id:
+                break
+
+        print("\n✅ Streaming complete.\n")
+        print(f"📝 Generated {len(prev_text.split())} words.\n")
+        return prev_text
+
+    else:
+        # Normal generation
+        outputs = model.generate(
+            **inputs,
+            max_length=512,
+            do_sample=True,
+            top_p=0.9,
+            temperature=0.7
+        )
+        decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        print(f"📝 Generated {len(decoded.split())} words.\n")
+        return decoded
+
+
 
 def rewrite_text(text, is_heading=False, is_list=False):
-    """Single-pass rewriting for speed."""
+    """Rewrites text with logging."""
     if not text.strip():
         return text
 
@@ -62,9 +113,10 @@ def rewrite_text(text, is_heading=False, is_list=False):
         prompt = f"Rephrase this bullet point with synonyms in easy words:\n\n{text}\n\nNew Bullet:"
     else:
         prompt = f"Rephrase this paragraph in natural easy English, plagiarism-free:\n\n{text}\n\nRewritten:"
-    
-    out = llama_generate(prompt)
-    return out.split(":")[-1].strip()
+
+    print(f"\n🔄 Rewriting: {text[:80]}...")
+    out = llama_generate(prompt, stream=True)  # STREAMING ENABLED
+    return out.strip()
 
 def process_paragraph(text, style):
     """Handle headings, lists, and paragraphs."""
@@ -99,50 +151,48 @@ def process_table(table):
     return ""
 
 # ---------------------------
-# MAIN PROCESSOR
+# MAIN PROCESSOR WITH PROGRESS BAR
 # ---------------------------
 def process_docx(input_file, output_file):
     doc = Document(input_file)
     md_lines = []
 
+    elements = list(doc.element.body)
+    total = len(elements)
     table_idx = 0
-    for block in doc.element.body:
-        tag = block.tag.split("}")[-1]
 
-        # Paragraphs
-        if tag == "p":
-            para = block
-            text = para.text.strip()
-            if not text:
-                continue
+    with tqdm(total=total, desc="📖 Processing DOCX", unit="block") as pbar:
+        for block in elements:
+            tag = block.tag.split("}")[-1]
 
-            # Detect LaTeX equations
-            if text.startswith("$") and text.endswith("$"):
-                md_lines.append(text + "\n")
-                continue
+            if tag == "p":
+                para = block
+                text = para.text.strip()
+                if text:
+                    style_name = getattr(para.style, "name", para.style if isinstance(para.style, str) else "Normal")
+                    rewritten = process_paragraph(text, style_name)
+                    md_lines.append(rewritten)
 
-            style_name = para.style.name if hasattr(para, "style") else "Normal"
-            rewritten = process_paragraph(text, style_name)
-            md_lines.append(rewritten)
+            elif tag == "tbl":
+                table_obj = doc.tables[table_idx]
+                print("📊 Processing table...")
+                md_lines.append(process_table(table_obj))
+                table_idx += 1
 
-        # Tables
-        elif tag == "tbl":
-            table_obj = doc.tables[table_idx]
-            md_lines.append(process_table(table_obj))
-            table_idx += 1
+            elif tag in ["drawing", "pict"]:
+                print("🖼️ Found image placeholder")
+                md_lines.append("![Image](image-placeholder.png)\n")
 
-        # Images
-        elif tag in ["drawing", "pict"]:
-            md_lines.append("![Image](image-placeholder.png)\n")
+            else:
+                md_lines.append("<!-- Other element preserved -->\n")
 
-        else:
-            md_lines.append("<!-- Other element preserved -->\n")
+            pbar.update(1)
+            pbar.set_postfix({"Remaining": total - pbar.n})
 
-    # Save Markdown
     with open(output_file, "w", encoding="utf-8") as f:
         f.write("\n".join(md_lines))
 
-    print(f"✅ Rewritten Markdown saved as {output_file}")
+    print(f"\n✅ Rewritten Markdown saved as {output_file}")
 
 # ---------------------------
 # RUN

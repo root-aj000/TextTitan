@@ -21,21 +21,23 @@ DEFAULT_FONT_SIZE = 12
 # ---------------------------
 # ENABLE LOGGING
 # ---------------------------
-logging.set_verbosity_error()  # minimize console noise
-
+logging.set_verbosity_error()
 torch.set_printoptions(precision=3, sci_mode=False)
 
 # ---------------------------
-# LOAD MODEL (LOW MEMORY)
+# LOAD / CACHE MODEL
 # ---------------------------
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, cache_dir=MODEL_DIR)
+if not os.path.exists(MODEL_DIR):
+    print("=====================================================")
+    print(f" Downloading model {MODEL_NAME} from Hugging Face...")
+    os.makedirs(MODEL_DIR, exist_ok=True)
 
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, cache_dir=MODEL_DIR)
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
     cache_dir=MODEL_DIR,
     torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-    low_cpu_mem_usage=True,  # 🟢 minimize RAM use
-    device_map="auto" if torch.cuda.is_available() else None
+    low_cpu_mem_usage=True
 )
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -45,11 +47,12 @@ model.to(device)
 # HELPERS
 # ---------------------------
 def chunk_text(text, size=CHUNK_SIZE):
+    """Split long text into smaller chunks."""
     words = text.split()
     return [" ".join(words[i:i+size]) for i in range(0, len(words), size)]
 
 def llama_generate(prompt):
-    """Low memory generation with streaming + cleanup"""
+    """Generate text with low memory usage."""
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=256).to(device)
 
     with torch.no_grad():
@@ -60,9 +63,10 @@ def llama_generate(prompt):
             top_p=0.9,
             temperature=0.7
         )
+
     text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
-    # 🧹 Free memory
+    # Free memory
     del inputs, output_ids
     gc.collect()
     if torch.cuda.is_available():
@@ -71,7 +75,7 @@ def llama_generate(prompt):
     return text
 
 def plagiarism_risk(original, rewritten):
-    """Estimate plagiarism risk (lightweight)."""
+    """Light plagiarism risk check using cosine similarity."""
     try:
         vec = TfidfVectorizer().fit([original, rewritten])
         sim = cosine_similarity(vec.transform([original]), vec.transform([rewritten]))[0][0]
@@ -91,16 +95,19 @@ def rewrite_text(text):
     return llama_generate(prompt).strip()
 
 def get_font_size(para):
+    """Get font size, default if missing."""
     for run in para.runs:
         if run.font.size:
             return run.font.size.pt
     return DEFAULT_FONT_SIZE
 
 def is_plain_paragraph(para):
+    """Skip text inside shapes/textboxes."""
     parent_tag = para._element.getparent().tag.split("}")[-1]
     return parent_tag == "body"
 
 def process_table(table, out_file):
+    """Convert table to markdown."""
     rows = []
     for row in table.rows:
         cells = [cell.text.strip() for cell in row.cells]
@@ -111,7 +118,7 @@ def process_table(table, out_file):
         out_file.write("\n".join([header, sep] + rows[1:]) + "\n\n")
 
 # ---------------------------
-# MAIN PROCESSOR (STREAMING)
+# MAIN PROCESSOR
 # ---------------------------
 def process_docx(input_file, output_file, warnings_file):
     doc = Document(input_file)
@@ -144,7 +151,7 @@ def process_docx(input_file, output_file, warnings_file):
                 level = int(level) if level.isdigit() else 2
                 f.write("#" * level + " " + text + "\n\n")
 
-            else:
+            else:  # Paragraph
                 if len(text.split()) > CHUNK_SIZE:
                     chunks = chunk_text(text)
                     rewritten_chunks = []
@@ -152,13 +159,13 @@ def process_docx(input_file, output_file, warnings_file):
                         try:
                             rewritten_chunks.append(rewrite_text(chunk))
                         except Exception as e:
-                            warn.write(f"⚠️ Rewrite failed for chunk: \"{chunk[:60]}...\" ({e})\n")
+                            warn.write(f"⚠️ Rewrite failed: \"{chunk[:60]}...\" ({e})\n")
                     rewritten = " ".join(rewritten_chunks)
                 else:
                     try:
                         rewritten = rewrite_text(text)
                     except Exception as e:
-                        warn.write(f"⚠️ Rewrite failed for paragraph: \"{text[:60]}...\" ({e})\n")
+                        warn.write(f"⚠️ Rewrite failed: \"{text[:60]}...\" ({e})\n")
                         rewritten = text
 
                 risk = plagiarism_risk(text, rewritten)
@@ -176,3 +183,9 @@ def process_docx(input_file, output_file, warnings_file):
 
     print(f"\n✅ Saved: {output_file}")
     print(f"📑 Warnings report: {warnings_file}")
+
+# ---------------------------
+# RUN
+# ---------------------------
+if __name__ == "__main__":
+    process_docx(INPUT_DOCX, OUTPUT_MD, WARNINGS_LOG)

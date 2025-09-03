@@ -2,6 +2,8 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, logging
 from docx import Document
 from tqdm import tqdm
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 import os
 import sys
 import time
@@ -95,12 +97,28 @@ def llama_generate(prompt, stream=True):
         )
         return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
+def plagiarism_risk(original, rewritten):
+    """Estimate plagiarism risk using cosine similarity."""
+    try:
+        vectorizer = TfidfVectorizer().fit([original, rewritten])
+        vectors = vectorizer.transform([original, rewritten])
+        similarity = cosine_similarity(vectors[0], vectors[1])[0][0]
+        risk = round(similarity * 100, 2)
+        return risk
+    except Exception:
+        return None
+
 def rewrite_text(text):
-    """Rewrites only paragraph text with logging."""
+    """Rewrites only paragraph text with logging and plagiarism reduction."""
     if not text.strip():
         return text
 
-    prompt = f"Rephrase this paragraph in natural easy English, plagiarism-free:\n\n{text}\n\nRewritten:"
+    prompt = (
+        f"Rephrase this paragraph in simple, plagiarism-free English. "
+        f"Use synonyms and natural language so it cannot be detected as copied. "
+        f"Keep meaning intact:\n\n{text}\n\nRewritten:"
+    )
+
     print(f"\n🔄 Rewriting: {text[:80]}...")
     return llama_generate(prompt, stream=True).strip()
 
@@ -173,13 +191,20 @@ def process_docx(input_file, output_file, warnings_file):
                             rewritten_chunks.append(rewrite_text(chunk))
                         except Exception as e:
                             warn.write(f"⚠️ Rewrite failed for chunk: \"{chunk[:60]}...\" ({e})\n")
-                    f.write(" ".join(rewritten_chunks) + "\n\n")
+                    rewritten = " ".join(rewritten_chunks)
                 else:
                     try:
                         rewritten = rewrite_text(text)
-                        f.write(rewritten + "\n\n")
                     except Exception as e:
                         warn.write(f"⚠️ Rewrite failed for paragraph: \"{text[:60]}...\" ({e})\n")
+                        rewritten = text
+
+                # Plagiarism risk check
+                risk = plagiarism_risk(text, rewritten)
+                if risk is not None:
+                    warn.write(f"📊 Plagiarism risk: {risk}% | Original: \"{text[:60]}...\"\n")
+
+                f.write(rewritten + "\n\n")
 
             prev_font_size = font_size
             pbar.update(1)
@@ -190,7 +215,7 @@ def process_docx(input_file, output_file, warnings_file):
             pbar.update(1)
 
     print(f"\n✅ Rewritten Markdown saved as {output_file}")
-    print(f"📑 Warnings saved as {warnings_file}")
+    print(f"📑 Warnings & plagiarism report saved as {warnings_file}")
 
 # ---------------------------
 # RUN

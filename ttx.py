@@ -1,5 +1,5 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline, logging
+from transformers import AutoTokenizer, AutoModelForCausalLM, logging
 from docx import Document
 from tqdm import tqdm
 import os
@@ -9,16 +9,18 @@ import time
 # ---------------------------
 # CONFIGURATION
 # ---------------------------
-INPUT_DOCX = "./src/input.docx"        # Input Word file
-OUTPUT_MD = "./src/rewritten.md"       # Output Markdown file
-CHUNK_SIZE = 80                        # Words per chunk
+INPUT_DOCX = "./src/input.docx"         # Input Word file
+OUTPUT_MD = "./src/rewritten.md"        # Output Markdown file
+WARNINGS_LOG = "./src/warnings.txt"     # Warnings report
+CHUNK_SIZE = 120                        # Words per chunk
 MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-MODEL_DIR = "./model"                  # Local save directory for model
+MODEL_DIR = "./model"                   # Local save directory for model
+DEFAULT_FONT_SIZE = 12                  # Default font size (pt)
 
 # ---------------------------
 # ENABLE LOGGING
 # ---------------------------
-logging.set_verbosity_info()      # Options: debug / info / warning / error
+logging.set_verbosity_info()
 logging.enable_explicit_format()
 
 os.environ["TORCH_SHOW_CPP_STACKTRACES"] = "1"
@@ -51,9 +53,8 @@ def chunk_text(text, size=CHUNK_SIZE):
     return [" ".join(words[i:i + size]) for i in range(0, len(words), size)]
 
 def llama_generate(prompt, stream=True):
-    """Generate rewritten text from TinyLlama with logs and streaming output."""
+    """Generate rewritten text from TinyLlama with streaming logs."""
     print("\n🧠 Model generating...")
-
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
     if stream:
@@ -68,11 +69,9 @@ def llama_generate(prompt, stream=True):
 
             generated = torch.cat((generated, next_token_id), dim=1)
 
-            # Decode full sequence so far
             decoded_so_far = tokenizer.decode(generated[0], skip_special_tokens=True)
-
-            # Find new part to print
             new_text = decoded_so_far[len(prev_text):]
+
             if new_text:
                 sys.stdout.write(new_text)
                 sys.stdout.flush()
@@ -84,11 +83,9 @@ def llama_generate(prompt, stream=True):
                 break
 
         print("\n✅ Streaming complete.\n")
-        print(f"📝 Generated {len(prev_text.split())} words.\n")
         return prev_text
 
     else:
-        # Normal generation
         outputs = model.generate(
             **inputs,
             max_length=512,
@@ -96,46 +93,28 @@ def llama_generate(prompt, stream=True):
             top_p=0.9,
             temperature=0.7
         )
-        decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        print(f"📝 Generated {len(decoded.split())} words.\n")
-        return decoded
+        return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-
-
-def rewrite_text(text, is_heading=False, is_list=False):
-    """Rewrites text with logging."""
+def rewrite_text(text):
+    """Rewrites only paragraph text with logging."""
     if not text.strip():
         return text
 
-    if is_heading:
-        prompt = f"Rephrase this heading in simple human-like words, plagiarism-free:\n\n{text}\n\nNew Heading:"
-    elif is_list:
-        prompt = f"Rephrase this bullet point with synonyms in easy words:\n\n{text}\n\nNew Bullet:"
-    else:
-        prompt = f"Rephrase this paragraph in natural easy English, plagiarism-free:\n\n{text}\n\nRewritten:"
-
+    prompt = f"Rephrase this paragraph in natural easy English, plagiarism-free:\n\n{text}\n\nRewritten:"
     print(f"\n🔄 Rewriting: {text[:80]}...")
-    out = llama_generate(prompt, stream=True)  # STREAMING ENABLED
-    return out.strip()
+    return llama_generate(prompt, stream=True).strip()
 
-def process_paragraph(text, style):
-    """Handle headings, lists, and paragraphs."""
-    style_lower = style.lower()
+def get_font_size(para):
+    """Extract font size of first run in a paragraph (default if missing)."""
+    for run in para.runs:
+        if run.font.size:
+            return run.font.size.pt
+    return DEFAULT_FONT_SIZE
 
-    if "heading" in style_lower:
-        rewritten = rewrite_text(text, is_heading=True)
-        level = style_lower.replace("heading", "").strip()
-        level = int(level) if level.isdigit() else 2
-        return "#" * level + " " + rewritten + "\n"
-
-    elif "list" in style_lower:
-        rewritten = rewrite_text(text, is_list=True)
-        return f"- {rewritten}"
-
-    else:  # Normal paragraph
-        chunks = chunk_text(text)
-        rewritten_chunks = [rewrite_text(chunk) for chunk in chunks]
-        return " ".join(rewritten_chunks) + "\n"
+def is_plain_paragraph(para):
+    """Check if paragraph is plain (not inside shape/textbox)."""
+    parent_tag = para._element.getparent().tag.split("}")[-1]
+    return parent_tag == "body"
 
 def process_table(table):
     """Convert Word tables into Markdown tables."""
@@ -143,59 +122,78 @@ def process_table(table):
     for row in table.rows:
         cells = [cell.text.strip() for cell in row.cells]
         rows.append("| " + " | ".join(cells) + " |")
-
     if rows:
         header = rows[0]
         separator = "| " + " | ".join(["---"] * (len(rows[0].split('|')) - 2)) + " |"
-        return "\n".join([header, separator] + rows[1:]) + "\n"
+        return "\n".join([header, separator] + rows[1:]) + "\n\n"
     return ""
 
 # ---------------------------
-# MAIN PROCESSOR WITH PROGRESS BAR
+# MAIN PROCESSOR
 # ---------------------------
-def process_docx(input_file, output_file):
+def process_docx(input_file, output_file, warnings_file):
     doc = Document(input_file)
-    md_lines = []
+    prev_font_size = None
 
-    elements = list(doc.element.body)
-    total = len(elements)
-    table_idx = 0
+    with tqdm(total=len(doc.paragraphs) + len(doc.tables),
+              desc="📖 Processing DOCX", unit="block") as pbar, \
+         open(output_file, "w", encoding="utf-8") as f, \
+         open(warnings_file, "w", encoding="utf-8") as warn:
 
-    with tqdm(total=total, desc="📖 Processing DOCX", unit="block") as pbar:
-        for block in elements:
-            tag = block.tag.split("}")[-1]
+        # Process paragraphs
+        for para in doc.paragraphs:
+            text = para.text.strip()
+            if not text:
+                pbar.update(1)
+                continue
 
-            if tag == "p":
-                para = block
-                text = para.text.strip()
-                if text:
-                    style_name = getattr(para.style, "name", para.style if isinstance(para.style, str) else "Normal")
-                    rewritten = process_paragraph(text, style_name)
-                    md_lines.append(rewritten)
+            if not is_plain_paragraph(para):
+                warn.write(f"⚠️ Skipped text inside shape/box: \"{text[:60]}...\"\n")
+                pbar.update(1)
+                continue
 
-            elif tag == "tbl":
-                table_obj = doc.tables[table_idx]
-                print("📊 Processing table...")
-                md_lines.append(process_table(table_obj))
-                table_idx += 1
+            font_size = get_font_size(para)
+            style_name = para.style.name.lower()
 
-            elif tag in ["drawing", "pict"]:
-                print("🖼️ Found image placeholder")
-                md_lines.append("![Image](image-placeholder.png)\n")
+            # Insert new line if font size changes or new paragraph
+            if prev_font_size is not None and font_size != prev_font_size:
+                f.write("\n")
 
-            else:
-                md_lines.append("<!-- Other element preserved -->\n")
+            if "heading" in style_name:
+                level = style_name.replace("heading", "").strip()
+                level = int(level) if level.isdigit() else 2
+                f.write("#" * level + " " + text + "\n\n")
 
+            else:  # Normal paragraph → rewrite
+                if len(text.split()) > CHUNK_SIZE:
+                    chunks = chunk_text(text)
+                    rewritten_chunks = []
+                    for chunk in chunks:
+                        try:
+                            rewritten_chunks.append(rewrite_text(chunk))
+                        except Exception as e:
+                            warn.write(f"⚠️ Rewrite failed for chunk: \"{chunk[:60]}...\" ({e})\n")
+                    f.write(" ".join(rewritten_chunks) + "\n\n")
+                else:
+                    try:
+                        rewritten = rewrite_text(text)
+                        f.write(rewritten + "\n\n")
+                    except Exception as e:
+                        warn.write(f"⚠️ Rewrite failed for paragraph: \"{text[:60]}...\" ({e})\n")
+
+            prev_font_size = font_size
             pbar.update(1)
-            pbar.set_postfix({"Remaining": total - pbar.n})
 
-    with open(output_file, "w", encoding="utf-8") as f:
-        f.write("\n".join(md_lines))
+        # Process tables
+        for table in doc.tables:
+            f.write(process_table(table))
+            pbar.update(1)
 
     print(f"\n✅ Rewritten Markdown saved as {output_file}")
+    print(f"📑 Warnings saved as {warnings_file}")
 
 # ---------------------------
 # RUN
 # ---------------------------
 if __name__ == "__main__":
-    process_docx(INPUT_DOCX, OUTPUT_MD)
+    process_docx(INPUT_DOCX, OUTPUT_MD, WARNINGS_LOG)
